@@ -1,0 +1,24 @@
+{
+	"admin/services/zig-dnsmasq": {
+		"title": "Zig DNSMasq",
+		"order": 45,
+		"action": {
+			"type": "view",
+			"path": "zig-dnsmasq/settings"
+		},
+		"depends": {
+			"acl": [ "luci-app-zig-dnsmasq" ]
+		}
+	},
+	"admin/services/zig-dnsmasq/status": {
+		"title": "状态",
+		"order": 1,
+		"action": {
+			"type": "view",
+			"path": "zig-dnsmasq/status"
+		},
+		"depends": {
+			"acl": [ "luci-app-zig-dnsmasq" ]
+		}
+	}
+}

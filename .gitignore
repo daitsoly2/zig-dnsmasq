@@ -1,0 +1,14 @@
+# 构建产物（zig build 生成，不入库）
+.zig-cache/
+zig-out*/
+v6probe-*
+
+# 实验目录（编译产物）
+.probe/
+
+# 测试运行产生的日志与临时配置
+e2e/*.log
+e2e/balance-*.conf
+
+# 一次性临时脚本（不应入库）
+_add_header.py

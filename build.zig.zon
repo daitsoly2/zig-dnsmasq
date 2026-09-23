@@ -1,0 +1,11 @@
+.{
+    .name = .zig_dnsmasq,
+    .version = "0.1.0",
+    .fingerprint = 0xbec0e0b3d45fe235,
+    .minimum_zig_version = "0.16.0",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

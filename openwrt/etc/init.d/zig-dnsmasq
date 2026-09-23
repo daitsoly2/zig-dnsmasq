@@ -1,0 +1,362 @@
+#!/bin/sh /etc/rc.common
+#
+# zig-dnsmasq — dnsmasq 2.93 的 Zig 0.16 移植版，作为独立 procd 服务运行
+#
+# 设计原则：
+#   1. 与系统自带 dnsmasq 相互独立。本脚本不修改 /etc/init.d/dnsmasq，
+#      是否接管 53 端口由 UCI 的 takeover 显式决定，避免误伤。
+#   2. 沿用 procd + ujail 沙箱，强度与系统 dnsmasq 一致。
+#
+# 关于 ujail 与 /sys —— 这是本服务能替换系统 dnsmasq 的关键前提：
+#   原版 dnsmasq 的 procd 沙箱没有挂载 /sys（ujail 的 -s 选项），所以任何
+#   依赖 /sys/class/net/<name>/ifindex 去解析 --interface= 的实现，一旦放进
+#   沙箱就会全部失败、退化成「只监听回环」，现象是进程活着但客户端一律
+#   解析不了。本移植的接口枚举自 RTM_GETLINK 起全部走 netlink，与原版 C 的
+#   iface_enumerate() 一致，因此无需为 ujail 额外挂载 /sys。
+#
+# 用法：
+#   service zig-dnsmasq start|stop|restart|reload|enable|disable
+#   service zig-dnsmasq takeover   # 停用系统 dnsmasq，接管 53
+#   service zig-dnsmasq revert     # 恢复系统 dnsmasq
+
+START=60
+STOP=15
+USE_PROCD=1
+
+PROG=/usr/bin/zig-dnsmasq
+CONFFILE=/var/etc/zig-dnsmasq.conf
+PIDFILE=/var/run/zig-dnsmasq.pid
+
+EXTRA_COMMANDS="takeover revert"
+EXTRA_HELP="	status	Show whether the service is running
+	takeover	Stop system dnsmasq and let zig-dnsmasq take over port 53
+	revert		Restore system dnsmasq on port 53
+	enable/disable	Create/remove the /etc/rc.d boot symlink"
+
+# status 与 info 的分工（实测行为，别再改错）：
+#   status -> 本脚本的 status_service()：人类可读的完整状态，LuCI 状态页用它。
+#   info   -> rc.common 自带的 procd 转储（实例 JSON）。**我们覆盖不了它** ——
+#             rc.common 的 info() 在本脚本之后定义，会盖掉同名函数。
+
+# ---- UCI 读取到的配置 ----
+_cfg_enabled=0
+_cfg_takeover=0
+_cfg_port=53
+_cfg_cachesize=8000
+_cfg_threads=0
+_cfg_dnsforwardmax=1500
+_cfg_interfaces=""
+_cfg_except=""
+_cfg_noresolv=0
+_cfg_resolvfile="/tmp/resolv.conf.d/resolv.conf.auto"
+_cfg_allservers=0
+_cfg_strictorder=0
+_cfg_domain=""
+_cfg_local=""
+_cfg_expandhosts=0
+_cfg_domainneeded=0
+_cfg_boguspriv=0
+_cfg_localise=0
+_cfg_ednsmax=1232
+_cfg_negcache=1
+_cfg_negttl=0
+_cfg_mincachettl=0
+_cfg_stalecache=0
+_cfg_logqueries=0
+_cfg_logfacility=""
+_cfg_hostsdir=""
+_cfg_extra=""
+
+_load_config() {
+	config_load zig-dnsmasq
+
+	config_get_bool _cfg_enabled     main enabled 0
+	config_get_bool _cfg_takeover    main takeover 0
+	config_get      _cfg_port        main port 53
+	config_get      _cfg_cachesize   main cachesize 8000
+	config_get      _cfg_threads     main threads 0
+	config_get      _cfg_dnsforwardmax main dnsforwardmax 1500
+	config_get      _cfg_interfaces  main interfaces ""
+	config_get      _cfg_except      main except_interfaces ""
+	config_get_bool _cfg_noresolv    main noresolv 0
+	config_get      _cfg_resolvfile  main resolvfile "/tmp/resolv.conf.d/resolv.conf.auto"
+	config_get_bool _cfg_allservers  main allservers 0
+	config_get_bool _cfg_strictorder main strictorder 0
+	config_get      _cfg_domain      main domain ""
+	config_get      _cfg_local       main local ""
+	config_get_bool _cfg_expandhosts main expandhosts 0
+	config_get_bool _cfg_domainneeded main domainneeded 0
+	config_get_bool _cfg_boguspriv   main boguspriv 0
+	config_get_bool _cfg_localise    main localise 0
+	config_get      _cfg_ednsmax     main ednsmax 1232
+	config_get_bool _cfg_negcache    main negcache 1
+	config_get      _cfg_negttl      main negttl 0
+	config_get      _cfg_mincachettl main mincachettl 0
+	config_get      _cfg_stalecache  main usestalecache 0
+	config_get_bool _cfg_logqueries  main logqueries 0
+	config_get      _cfg_logfacility main logfacility ""
+	config_get      _cfg_hostsdir    main hostsdir ""
+	config_get      _cfg_extra       main extraoptions ""
+}
+
+_emit_server() {
+	[ -n "$1" ] && echo "server=$1"
+}
+
+# 由 UCI 生成 dnsmasq 风格的配置文件
+_gen_config() {
+	mkdir -p "$(dirname "$CONFFILE")"
+
+	{
+		echo "# 由 /etc/init.d/zig-dnsmasq 从 /etc/config/zig-dnsmasq 自动生成"
+		echo "# 手动修改无效，请改 UCI 后执行: service zig-dnsmasq reload"
+		echo ""
+
+		echo "port=$_cfg_port"
+		echo "cache-size=$_cfg_cachesize"
+		echo "dns-forward-max=$_cfg_dnsforwardmax"
+		echo "edns-packet-max=$_cfg_ednsmax"
+
+		# --threads=0 表示自动按 CPU 数配置
+		[ "$_cfg_threads" != "0" ] && echo "threads=$_cfg_threads"
+
+		# 接口约束：不配置就退化为通配监听（与 dnsmasq 默认行为一致）
+		for iface in $_cfg_interfaces; do
+			echo "interface=$iface"
+		done
+		for except in $_cfg_except; do
+			echo "except-interface=$except"
+		done
+
+		# 上游
+		if [ "$_cfg_noresolv" = "1" ]; then
+			echo "no-resolv"
+		else
+			[ -n "$_cfg_resolvfile" ] && echo "resolv-file=$_cfg_resolvfile"
+		fi
+		config_list_foreach main server _emit_server
+		[ "$_cfg_allservers" = "1" ] && echo "all-servers"
+		[ "$_cfg_strictorder" = "1" ] && echo "strict-order"
+
+		# 本地域名
+		[ -n "$_cfg_domain" ] && echo "domain=$_cfg_domain"
+		[ -n "$_cfg_local" ] && echo "local=/$_cfg_local/"
+		[ "$_cfg_expandhosts" = "1" ] && echo "expand-hosts"
+		[ "$_cfg_domainneeded" = "1" ] && echo "domain-needed"
+		[ "$_cfg_boguspriv" = "1" ] && echo "bogus-priv"
+		[ "$_cfg_localise" = "1" ] && echo "localise-queries"
+
+		# 缓存行为
+		[ "$_cfg_negcache" = "0" ] && echo "no-negcache"
+		[ "$_cfg_negttl" != "0" ] && echo "neg-ttl=$_cfg_negttl"
+		[ "$_cfg_mincachettl" != "0" ] && echo "min-cache-ttl=$_cfg_mincachettl"
+		[ "$_cfg_stalecache" != "0" ] && echo "use-stale-cache=$_cfg_stalecache"
+
+		# 日志
+		# logfacility 的取值规则（与 C 的 --log-facility 一致）：
+		#   含 '/' 或等于 "-" → 当文件路径；否则当 syslog facility 名
+		#   （daemon / local0 …）。走 syslog 时 priority 由我们自己带，
+		#   这样 logread 里级别才正确 —— 否则 procd 会把 stderr 一律
+		#   按 daemon.err 上报，info 级日志顶着 err 级别，看着像报错。
+		if [ -n "$_cfg_logfacility" ]; then
+			echo "log-facility=$_cfg_logfacility"
+		fi
+		[ "$_cfg_logqueries" = "1" ] && echo "log-queries"
+
+		# 额外 hosts 目录：odhcpd 把 odhcpd.hosts.<ifname> 写在这里，
+		# 读进来 `<host>.lan` 才能解析。目录变化由 inotify 即时跟随。
+		[ -n "$_cfg_hostsdir" ] && echo "hostsdir=$_cfg_hostsdir"
+
+		# 透传的额外选项
+		for pair in $_cfg_extra; do
+			echo "${pair//,/=}"
+		done
+	} > "$CONFFILE"
+}
+
+start_service() {
+	_load_config
+
+	if [ "$_cfg_enabled" != "1" ]; then
+		logger -t zig-dnsmasq "未启用。请执行: /etc/init.d/zig-dnsmasq enable && uci set zig-dnsmasq.main.enabled=1 && uci commit"
+		logger -t zig-dnsmasq "（注意 enable 与 enabled 是两件事：enable 建 /etc/rc.d 开机自启链接，enabled 控制本次是否真正启动。只设 enabled 不会开机自启。）"
+		return 1
+	fi
+
+	if [ ! -x "$PROG" ]; then
+		logger -t zig-dnsmasq "$PROG 不存在或不可执行"
+		return 1
+	fi
+
+	_gen_config
+
+	procd_open_instance
+	procd_set_param command "$PROG" -C "$CONFFILE" -k -x "$PIDFILE"
+	procd_set_param file "$CONFFILE"
+	procd_set_param stdout 1
+	procd_set_param stderr 1
+	procd_set_param respawn 3600 5 3
+
+	# 沙箱：与原版 dnsmasq 同等强度。
+	# 注意这里刻意没有挂载 /sys —— 本移植用 netlink 枚举接口，不需要它。
+	#
+	# `log` 关键字是必需的，且**只能**用它来给沙箱提供 /dev/log：
+	# 它对应 ujail 的 `-l`（"jail has /dev/log"），procd 会把它翻成
+	# jail JSON 里的 `"log": true`。实测**不能**用
+	# `procd_add_jail_mount /dev/log` 代替 —— 那样 JSON 里确实会出现
+	# "/dev/log":"0"，但 /dev/log 是个 **socket**，ujail 的 staging 建不出它，
+	# 进到沙箱里一看 /proc/<pid>/root/dev/log 根本不存在（我踩过）。
+	procd_add_jail zig-dnsmasq log
+	procd_add_jail_mount "$CONFFILE" /etc/hosts /etc/passwd /etc/group /etc/TZ /etc/ethers
+	procd_add_jail_mount_rw /var/run/
+	if [ "$_cfg_noresolv" != "1" ] && [ -n "$_cfg_resolvfile" ]; then
+		procd_add_jail_mount "$_cfg_resolvfile"
+	fi
+
+	# /tmp/hosts：hostsdir 的默认目录（odhcpd 在这里写 odhcpd.hosts.<ifname>）。
+	# ujail 的 /tmp 是空的私有 tmpfs，不挂就看不到宿主的文件 —— 这正是
+	# `debian.lan` 一直解析不了的原因之一。inotify 监视也依赖它可见。
+	# 挂 rw 是因为有些工具链会在该目录里建临时文件（DNS 自身只读）。
+	if [ -d /tmp/hosts ]; then
+		procd_add_jail_mount_rw /tmp/hosts
+	fi
+
+	procd_close_instance
+
+	logger -t zig-dnsmasq "已启动（端口 $_cfg_port）"
+}
+
+stop_service() {
+	rm -f "$PIDFILE"
+}
+
+reload_service() {
+	restart
+}
+
+service_triggers() {
+	procd_add_reload_trigger zig-dnsmasq
+
+	# 网络就绪通知：接口 up/变化时 procd 直接对本服务跑 `reload`（= restart）。
+	#
+	# 为什么需要：我们 START=60，而 netifd 建 LAN 桥、PPPoE 拨 WAN 都是**异步**的。
+	# 到得太早会拿到「还没出生」的接口、以及空的 resolv.conf.auto —— 实测开机后
+	# 进程在、端口在，却刷了满屏「没有可用的上游服务器」，必须手动重启才恢复。
+	# 有了这两个触发器，接口一就绪 procd 就把我们重启一次，自愈闭环。
+	# （与守护进程内的 RTNLGRP_LINK 订阅互为补充：前者覆盖启动竞态，
+	#   后者覆盖运行期热插拔。）
+	procd_add_reload_interface_trigger lan
+	procd_add_reload_interface_trigger wan
+}
+
+# 找出真正的守护进程 pid。
+#
+# **不能信 $PIDFILE**：我们跑在 ujail 的 PID namespace 里（实测
+# `/proc/<hostpid>/status` 的 `NSpid: 9355 1`），守护进程用 getpid() 拿到的
+# 永远是 **1**，于是 `/var/run/zig-dnsmasq.pid` 里写的就是 "1"。
+# 拿它去查状态，会把 PID 1（procd）的 RSS 当成 DNS 的报出来 —— 一个
+# 1468 kB 的假数字，在排查内存问题时特别容易误导。
+#
+# 也不能信 `pgrep -x zig-dnsmasq` 的第一个结果：那是 ujail 包装进程
+# （cmdline 是 `/sbin/ujail ...`，RSS 恒定 ~1.3MB，同样会掩盖真实占用）。
+#
+# 所以按 cmdline 的第一段精确匹配 $PROG —— ujail 包装进程天然落选。
+find_daemon_pid() {
+	for _d in /proc/[0-9]*; do
+		[ -r "$_d/cmdline" ] || continue
+		case "$(tr '\0' '\n' < "$_d/cmdline" 2>/dev/null | head -n1)" in
+			"$PROG") echo "${_d#/proc/}"; return 0 ;;
+		esac
+	done
+	return 1
+}
+
+# rc.common 的 status 命令会优先调用 status_service()（若存在），否则退化到
+# _procd_status 输出一串实例 JSON（`/etc/rc.common:179` 实测如此 —— 所以
+# 光定义 status() 是**死代码**，rc.common 根本不会调它）。
+# 这里定义该官方钩子，使 `service zig-dnsmasq status` 输出人类可读的完整状态。
+# 刻意把所有信息采集收敛在本脚本内，这样 rpcd 的 ACL 只需要放开这一个
+# 脚本的 exec，无需允许 /bin/sh。
+status_service() {
+	_load_config
+
+	echo "=== 配置开关 ==="
+	echo "enabled=$_cfg_enabled  port=$_cfg_port  takeover=$_cfg_takeover"
+	echo "interfaces=${_cfg_interfaces:-（未限制）}"
+	echo "except_interfaces=${_cfg_except:-（无）}"
+
+	echo ""
+	echo "=== 进程 ==="
+	pid=$(find_daemon_pid)
+	if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+		echo "运行中：pid=$pid（沙箱内 pid namespace 里它是 1，见 $PROG 注释）"
+		grep -E '^(Name|State|VmRSS|VmPeak|Threads)' "/proc/$pid/status" 2>/dev/null
+		echo -n "累计 CPU: "
+		awk '{printf "%d ticks\n", $14+$15}' "/proc/$pid/stat" 2>/dev/null
+	else
+		echo "未运行"
+	fi
+
+	echo ""
+	echo "=== 监听端口 ==="
+	local pat=":$_cfg_port "
+	netstat -lun 2>/dev/null | grep "$pat" || echo "（未监听 $_cfg_port）"
+
+	echo ""
+	echo "=== 开机自启 ==="
+	[ -L /etc/rc.d/S*"$(basename "$initscript")" ] 2>/dev/null && \
+	echo "已 enable（重启后自动运行）" || echo "未 enable —— 重启后不会自动启动，请执行 enable"
+
+	echo ""
+	echo "=== 系统 dnsmasq ==="
+	/etc/init.d/dnsmasq enabled 2>/dev/null && echo "开机自启=是" || echo "开机自启=否"
+
+	echo ""
+	echo "=== 生效配置 $CONFFILE ==="
+	cat "$CONFFILE" 2>/dev/null || echo "（尚未生成）"
+
+	echo ""
+	echo "=== 最近日志 ==="
+	logread 2>/dev/null | grep -i "zig-dnsmasq" | tail -20 || echo "（无）"
+}
+
+# 注意：**不要**在这里定义 info()。
+#
+# rc.common 自己在 `_procd_wrapper` 里就定义了 `info`（`/etc/rc.common:125`
+# 的 `extra_command "info" "Dump procd service info"` + `:149` 的 `info()`），
+# 而它的定义在本脚本之后执行，因此会**覆盖**我们这里的同名函数。
+# 实测：`service zig-dnsmasq info` 输出的是 procd 的实例 JSON，不是本函数。
+# 真正可控的入口是 `status` → `status_service`。
+# LuCI 状态页原先调 `info`，拿到的是那串 JSON；现已改为调 `status`。
+
+takeover() {
+	logger -t zig-dnsmasq "开始接管：停用系统 dnsmasq"
+	/etc/init.d/dnsmasq stop 2>/dev/null
+	sleep 1
+	uci set zig-dnsmasq.main.enabled=1
+	uci set zig-dnsmasq.main.port=53
+	uci commit zig-dnsmasq
+	# 必须同时 enable：`enabled=1` 只让 start_service 继续执行，不建
+	# /etc/rc.d 自启链接。漏掉它，「接管」只在本次生效，重启就没了。
+	enable
+	restart
+	sleep 2
+	echo "--- 接管结果 ---"
+	netstat -lun 2>/dev/null | grep ":53 "
+	logger -t zig-dnsmasq "已接管 53 端口（已 enable，重启后自动运行）"
+}
+
+revert() {
+	logger -t zig-dnsmasq "开始回退：恢复系统 dnsmasq"
+	stop
+	uci set zig-dnsmasq.main.enabled=0
+	uci commit zig-dnsmasq
+	# 与 takeover 对称：把自启链接也摘掉，否则重启后仍会尝试启动
+	# （届时 enabled=0 会让 start_service 提前返回，只是白跑一趟并留下告警）
+	disable
+	/etc/init.d/dnsmasq start
+	sleep 2
+	echo "--- 回退结果 ---"
+	netstat -lun 2>/dev/null | grep ":53 "
+	logger -t zig-dnsmasq "已回退到系统 dnsmasq"
+}

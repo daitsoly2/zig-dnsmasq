@@ -1,0 +1,63 @@
+config zig-dnsmasq 'main'
+	# 总开关。装入后默认为 0，避免抢走系统 dnsmasq 的 DNS 服务。
+	# 准备接管时执行: uci set zig-dnsmasq.main.enabled=1; uci commit
+	option enabled '0'
+
+	# 是否在执行 takeover 时停用系统 dnsmasq 并占用 53 端口。
+	# 单独改这一项无效，须通过: service zig-dnsmasq takeover
+	option takeover '0'
+
+	# ---- 监听 ----
+	option port '53'
+	# 只在这些网卡上提供服务。留空 = 监听通配地址（dnsmasq 默认行为）。
+	# 在路由器上强烈建议指定 LAN 网卡，否则等于把递归解析器暴露到 WAN。
+	option interfaces 'br-lan'
+	option except_interfaces 'lan3 pppoe-wan'
+
+	# ---- 上游 ----
+	option noresolv '0'
+	option resolvfile '/tmp/resolv.conf.d/resolv.conf.auto'
+	# 可额外指定静态上游，会追加到 resolv-file 读到的列表之后
+	#list server '223.5.5.5'
+	#list server '114.114.114.114'
+	option allservers '0'
+	option strictorder '0'
+
+	# ---- 缓存 ----
+	option cachesize '8000'
+	option dnsforwardmax '1500'
+	option negcache '1'
+	option negttl '0'
+	option mincachettl '0'
+	# >0 时启用陈旧缓存服务（对应 --use-stale-cache）
+	option usestalecache '0'
+
+	# ---- 本地域名 ----
+	option domain 'lan'
+	option local 'lan'
+	option expandhosts '1'
+	option domainneeded '1'
+	option boguspriv '1'
+	option localise '0'
+
+	# ---- 其他 ----
+	option threads '0'
+	option ednsmax '1232'
+	option logqueries '0'
+	# 日志设施（对应 dnsmasq 的 --log-facility）：
+	#   留空 或 '-'   → 输出到 stderr，由 procd 捕获。**注意 procd 会把
+	#                   stderr 一律按 daemon.err 上报**，于是 info/notice
+	#                   级别的日志在 logread 里顶着 err 级别，按级别过滤也
+	#                   不对（观感像一直在报错）。
+	#   daemon / local0… 等 facility 名 → 走 syslog，priority 由我们自己带，
+	#                   logread 里的级别才正确。**推荐 'daemon'**。
+	#   含 '/' 的值（如 /tmp/log/z.log）→ 当成日志文件。
+	option logfacility 'daemon'
+
+	# 额外 hosts 目录（对应 --hostsdir）：目录里每个普通文件都当 hosts 读。
+	# odhcpd 把 odhcpd.hosts.<ifname> 写在这里，是 `<host>.lan` 能解析的前提。
+	# 目录内容变化由 inotify 即时跟随（不必重启）。留空 = 不读。
+	option hostsdir '/tmp/hosts'
+
+	# 额外透传选项，逗号分隔写成 `<option>,<value>`，例如: localise-queries,1
+	#option extraoptions ''
